@@ -38,7 +38,7 @@ mongo_url = os.environ.get("MONGO_URL") or os.environ.get("DATABASE_URL")
 if not mongo_url:
     raise RuntimeError("MONGO_URL (or DATABASE_URL) is required")
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get("DB_NAME", "sfr")]
+db = client[os.environ.get("DB_NAME", "Sfr")]
 
 JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_hex(32)
 JWT_ALGORITHM = "HS256"
@@ -868,7 +868,16 @@ async def seed():
 
 @api_router.get("/")
 async def root():
-    return {"message": "SFR Espace Client API"}
+    return {"message": "SFR Espace Client API", "status": "ok"}
+
+
+@api_router.get("/health")
+async def health():
+    try:
+        await db.command("ping")
+        return {"status": "ok", "mongo": True}
+    except Exception as e:
+        return {"status": "degraded", "mongo": False, "error": str(e)[:200]}
 
 
 app.include_router(api_router)
@@ -884,7 +893,10 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    await seed()
+    try:
+        await seed()
+    except Exception as e:
+        logger.error("Seed failed (app continues): %s", e)
 
 
 @app.on_event("shutdown")
