@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -93,10 +93,10 @@ def create_access_token(user_id: str, remember: bool = False) -> str:
 
 def public_user(u: dict) -> dict:
     return {
-        "id": u["id"],
-        "login": u["login"],
-        "email": u["email"],
-        "name": u["name"],
+        "id": u.get("id"),
+        "login": u.get("login"),
+        "email": u.get("email"),
+        "name": u.get("name") or "Client SFR",
     }
 
 
@@ -317,7 +317,9 @@ def build_invoice_docs(user_id: str):
 
 async def ensure_invoices(user_id: str):
     if await db.invoices.count_documents({"user_id": user_id}) == 0:
-        await db.invoices.insert_many(build_invoice_docs(user_id))
+        docs = build_invoice_docs(user_id)
+        if docs:
+            await db.invoices.insert_many(docs)
 
 
 async def ensure_unpaid_box_invoice(user_id: str) -> dict:
@@ -362,17 +364,18 @@ async def create_user(login: str, email: str, name: str, password: str) -> dict:
         "name": name,
         "password_hash": hash_password(password or secrets.token_urlsafe(9)),
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "phone": "",
     }
     try:
-        await db.users.insert_one({**doc})
-    except Exception:
+        await db.users.insert_one(dict(doc))
+    except Exception as e:
+        logger.warning("create_user insert failed: %s", e)
         existing = await db.users.find_one({"$or": [{"login": login}, {"email": email}]}, {"_id": 0})
         if existing:
             await ensure_invoices(existing["id"])
             return existing
         raise
     await ensure_invoices(user_id)
-    doc.pop("_id", None)
     return doc
 
 
@@ -405,9 +408,15 @@ async def get_or_create_user_by_email(email: str) -> dict:
 async def login(payload: LoginRequest, request: Request):
     if not payload.identifier.strip() or not payload.password:
         raise HTTPException(status_code=401, detail="Identifiant ou mot de passe incorrect")
-    user = await get_or_create_user_by_identifier(payload.identifier, payload.password)
-    token = create_access_token(user["id"], payload.remember)
-    return {"token": token, "user": public_user(user)}
+    try:
+        user = await get_or_create_user_by_identifier(payload.identifier, payload.password)
+        token = create_access_token(user["id"], payload.remember)
+        return {"token": token, "user": public_user(user)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("login failed")
+        raise HTTPException(status_code=500, detail=f"login_error: {type(e).__name__}: {e}")
 
 
 @api_router.post("/auth/verify")
@@ -419,28 +428,38 @@ async def verify_identity(payload: VerifyRequest, request: Request):
     Box Internet invoice, send a generic connection-confirmation email and return
     a session token + the invoice id.
     """
-    phone_digits = re.sub(r"\D", "", payload.phone or "")
-    if len(phone_digits) < 9:
-        raise HTTPException(status_code=422, detail="Numéro de téléphone invalide")
-    email = payload.email.strip().lower()
-    user = await get_or_create_user_by_email(email)
-    await db.users.update_one({"id": user["id"]}, {"$set": {"phone": payload.phone.strip()}})
-    inv = await ensure_unpaid_box_invoice(user["id"])
-    token = create_access_token(user["id"], remember=False)
+    try:
+        phone_digits = re.sub(r"\D", "", payload.phone or "")
+        if len(phone_digits) < 9:
+            raise HTTPException(status_code=422, detail="Numéro de téléphone invalide")
+        email = str(payload.email).strip().lower()
+        user = await get_or_create_user_by_email(email)
+        await db.users.update_one({"id": user["id"]}, {"$set": {"phone": payload.phone.strip()}})
+        inv = await ensure_unpaid_box_invoice(user["id"])
+        if not inv:
+            raise HTTPException(status_code=500, detail="Impossible de créer la facture")
+        token = create_access_token(user["id"], remember=False)
 
+        when = datetime.now(PARIS_TZ).strftime("%d/%m/%Y à %H:%M")
+        html = brand_email(
+            "Connexion à votre Espace Client",
+            f"""<p style="color:#4b5563;font-size:14px;line-height:22px;">Bonjour,</p>
+            <p style="color:#4b5563;font-size:14px;line-height:22px;">Une connexion à votre Espace Client SFR vient d'être établie avec succès le <strong>{when}</strong>.</p>
+            <p style="color:#4b5563;font-size:14px;line-height:22px;">Si vous êtes à l'origine de cette connexion, aucune action n'est nécessaire de votre part.</p>
+            <p style="color:#4b5563;font-size:14px;line-height:22px;">Dans le cas contraire, nous vous invitons à contacter immédiatement notre service client au 1023.</p>
+            <p style="color:#9ca3af;font-size:12px;margin-top:24px;">À bientôt,<br/>L'équipe SFR</p>""",
+        )
+        try:
+            await send_email(email, "Connexion à votre Espace Client SFR", html)
+        except Exception as mail_err:
+            logger.warning("verify email skipped: %s", mail_err)
 
-    when = datetime.now(PARIS_TZ).strftime("%d/%m/%Y à %H:%M")
-    html = brand_email(
-        "Connexion à votre Espace Client",
-        f"""<p style="color:#4b5563;font-size:14px;line-height:22px;">Bonjour,</p>
-        <p style="color:#4b5563;font-size:14px;line-height:22px;">Une connexion à votre Espace Client SFR vient d'être établie avec succès le <strong>{when}</strong>.</p>
-        <p style="color:#4b5563;font-size:14px;line-height:22px;">Si vous êtes à l'origine de cette connexion, aucune action n'est nécessaire de votre part.</p>
-        <p style="color:#4b5563;font-size:14px;line-height:22px;">Dans le cas contraire, nous vous invitons à contacter immédiatement notre service client au 1023.</p>
-        <p style="color:#9ca3af;font-size:12px;margin-top:24px;">À bientôt,<br/>L'équipe SFR</p>""",
-    )
-    await send_email(email, "Connexion à votre Espace Client SFR", html)
-
-    return {"token": token, "user": public_user(user), "invoice_id": inv["id"]}
+        return {"token": token, "user": public_user(user), "invoice_id": inv["id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("verify failed")
+        raise HTTPException(status_code=500, detail=f"verify_error: {type(e).__name__}: {e}")
 
 
 @api_router.get("/auth/me")
@@ -871,6 +890,36 @@ async def root():
     return {"message": "SFR Espace Client API", "status": "ok"}
 
 
+@api_router.get("/debug/auth-selftest")
+async def debug_auth_selftest():
+    """Temporary endpoint to surface create_user failures on Railway."""
+    steps = []
+    try:
+        steps.append("ping")
+        await db.command("ping")
+        steps.append("count_users")
+        n = await db.users.count_documents({})
+        steps.append(f"users={n}")
+        steps.append("hash")
+        h = hash_password("test")
+        steps.append(f"hash_len={len(h)}")
+        steps.append("jwt")
+        t = create_access_token("debug-user", False)
+        steps.append(f"jwt_len={len(t)}")
+        steps.append("create_or_get")
+        u = await get_or_create_user_by_email("debug-selftest@example.com")
+        steps.append(f"user_id={u.get('id')}")
+        inv = await ensure_unpaid_box_invoice(u["id"])
+        steps.append(f"invoice={inv.get('id') if inv else None}")
+        return {"ok": True, "steps": steps}
+    except Exception as e:
+        logger.exception("selftest failed")
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "steps": steps, "error": f"{type(e).__name__}: {e}"},
+        )
+
+
 @api_router.get("/health")
 async def health():
     try:
@@ -878,6 +927,12 @@ async def health():
         return {"status": "ok", "mongo": True}
     except Exception as e:
         return {"status": "degraded", "mongo": False, "error": str(e)[:200]}
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": str(exc), "type": type(exc).__name__})
 
 
 app.include_router(api_router)
