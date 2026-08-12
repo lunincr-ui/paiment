@@ -38,7 +38,16 @@ mongo_url = os.environ.get("MONGO_URL") or os.environ.get("DATABASE_URL")
 if not mongo_url:
     raise RuntimeError("MONGO_URL (or DATABASE_URL) is required")
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get("DB_NAME", "Sfr")]
+
+def _normalize_db_name(name: str) -> str:
+    # Railway Mongo already created "Sfr"; force correct case for common variants
+    n = (name or "Sfr").strip() or "Sfr"
+    if n.lower() == "sfr":
+        return "Sfr"
+    return n
+
+DB_NAME = _normalize_db_name(os.environ.get("DB_NAME", "Sfr"))
+db = client[DB_NAME]
 
 JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_hex(32)
 JWT_ALGORITHM = "HS256"
@@ -948,6 +957,18 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
+    global db, DB_NAME
+    try:
+        names = await client.list_database_names()
+        preferred = _normalize_db_name(os.environ.get("DB_NAME", "Sfr"))
+        match = next((n for n in names if n.lower() == preferred.lower()), preferred)
+        if match != DB_NAME:
+            logger.warning("Switching DB_NAME %s -> %s (existing databases)", DB_NAME, match)
+            DB_NAME = match
+            db = client[DB_NAME]
+        logger.info("Using MongoDB database: %s", DB_NAME)
+    except Exception as e:
+        logger.error("DB name resolve failed: %s", e)
     try:
         await seed()
     except Exception as e:
